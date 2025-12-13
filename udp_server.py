@@ -6,7 +6,17 @@ PACKET_SIZE = 100
 CLIENT_TIMEOUT = 5.0
 STARVATION_THRESHOLD = 0.100
 
-HEADER_FORMAT = "!Id"
+"""
+TWAMP-style header carried in both directions:
+    seq:   uint32 (network byte order)
+    T1:    double (client send time)
+    T2:    double (server receive time)
+    T3:    double (server send time)
+
+On client -> server, only seq and T1 are meaningful; T2/T3 can be zero.
+On server -> client, all fields are filled: seq, original T1, server's T2 and T3.
+"""
+HEADER_FORMAT = "!Iddd"
 HEADER_SIZE   = struct.calcsize(HEADER_FORMAT)
 
 sel = selectors.DefaultSelector()
@@ -107,10 +117,14 @@ while True:
         session = clients[addr]
 
         if len(data) >= HEADER_SIZE:
-            seq, client_ts = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
+            # Unpack incoming probe. For client->server traffic, only seq and T1 are set.
+            seq, t1, _t2_in, _t3_in = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
             session.add_packet(seq, recv_ts)
 
-            reply = struct.pack(HEADER_FORMAT, seq, recv_ts)
+            # Prepare reply with server-side timestamps: T2 (recv) and T3 (send)
+            t2 = recv_ts
+            t3 = time.time()
+            reply = struct.pack(HEADER_FORMAT, seq, t1, t2, t3)
             reply = reply.ljust(PACKET_SIZE, b"x")
 
             if ":" in addr[0]:
@@ -124,4 +138,3 @@ while True:
         if now - session.last_heard > CLIENT_TIMEOUT:
             session.print_stats(addr)
             del clients[addr]
-
