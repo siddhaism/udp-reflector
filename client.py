@@ -2,7 +2,6 @@
 import argparse
 import asyncio
 import json
-import math
 import os
 import platform
 import socket
@@ -11,6 +10,8 @@ import subprocess
 from typing import Optional
 import time
 from statistics import mean
+
+from metrics import percentile, smoothed_packet_rates, stddev
 
 
 MAGIC = b"MTP1"
@@ -21,24 +22,6 @@ MODE_VIDEO = 2
 
 def now_ns():
     return time.time_ns()
-
-
-def percentile(data, p):
-    if not data:
-        return None
-    if p <= 0:
-        return float(min(data))
-    if p >= 100:
-        return float(max(data))
-    s = sorted(data)
-    k = (len(s) - 1) * (p / 100.0)
-    f = math.floor(k)
-    c = math.ceil(k)
-    if f == c:
-        return float(s[int(k)])
-    d0 = s[int(f)] * (c - k)
-    d1 = s[int(c)] * (k - f)
-    return float(d0 + d1)
 
 
 def fmt_opt(v, unit=""):
@@ -163,32 +146,17 @@ class Metrics:
         rord_max = max(self.reorder_depths) if self.reorder_depths else None
 
         # PPS stability from IPA
-        def stddev(xs):
-            if not xs:
-                return None
-            m = sum(xs) / len(xs)
-            return (sum((x - m) ** 2 for x in xs) / len(xs)) ** 0.5
         pps_p50 = percentile(self.pps_series, 50)
         pps_p95 = percentile(self.pps_series, 95)
         pps_p99 = percentile(self.pps_series, 99)
         pps_std = stddev(self.pps_series)
 
         # Smoothed PPS over 1s sliding window using arrival timestamps
-        smooth_rates = []
-        ts = self.arrival_ms_series
-        j = 0
-        for i in range(len(ts)):
-            t = ts[i]
-            win_start = t - 1000.0
-            while j < i and ts[j] < win_start:
-                j += 1
-            count = (i - j + 1)
-            if count > 0:
-                smooth_rates.append(float(count))  # per 1s window
+        smooth_rates = smoothed_packet_rates(self.arrival_ms_series)
         sp50 = percentile(smooth_rates, 50)
         sp95 = percentile(smooth_rates, 95)
         sp99 = percentile(smooth_rates, 99)
-        spstd = (lambda xs: None if not xs else ((sum((x - (sum(xs)/len(xs)))**2 for x in xs)/len(xs))**0.5))(smooth_rates)
+        spstd = stddev(smooth_rates)
 
         # Audio MOS using simplified E-model approximation (G.711-like, Ie=0, Bpl=10)
         audio_mos = None
