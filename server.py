@@ -4,30 +4,13 @@ import asyncio
 import json
 import socket
 import time
-import math
-from collections import deque, defaultdict
+from collections import deque
 from dataclasses import dataclass
+
+from metrics import percentile, smoothed_packet_rates, stddev
 
 # ===== Metrics Aggregator =====
 MAGIC = b"MTP1"
-
-
-def percentile(data, p):
-    if not data:
-        return None
-    if p <= 0:
-        return float(min(data))
-    if p >= 100:
-        return float(max(data))
-    s = sorted(data)
-    k = (len(s) - 1) * (p / 100.0)
-    f = math.floor(k)
-    c = math.ceil(k)
-    if f == c:
-        return float(s[int(k)])
-    d0 = s[int(f)] * (c - k)
-    d1 = s[int(c)] * (k - f)
-    return float(d0 + d1)
 
 
 class FlowStats:
@@ -269,17 +252,7 @@ class Aggregator:
             pps_p99 = percentile(list(fs.pps_series), 99)
             pps_std = stddev(list(fs.pps_series))
             # Smoothed PPS (1s window) using arrival_ms series
-            smooth_rates = []
-            ts = list(fs.arrival_ms)
-            j = 0
-            for i in range(len(ts)):
-                t = ts[i]
-                win_start = t - 1000.0
-                while j < i and ts[j] < win_start:
-                    j += 1
-                count = (i - j + 1)
-                if count > 0:
-                    smooth_rates.append(float(count))
+            smooth_rates = smoothed_packet_rates(list(fs.arrival_ms))
             sp50 = percentile(smooth_rates, 50)
             sp95 = percentile(smooth_rates, 95)
             sp99 = percentile(smooth_rates, 99)
@@ -340,16 +313,7 @@ class Aggregator:
         agg_pps_inst = (percentile(all_pps, 50), percentile(all_pps, 95), percentile(all_pps, 99), stddev(all_pps))
         # Aggregate smoothed PPS: build sliding counts across all arrivals
         all_ts.sort()
-        smooth_rates = []
-        j = 0
-        for i in range(len(all_ts)):
-            t = all_ts[i]
-            win_start = t - 1000.0
-            while j < i and all_ts[j] < win_start:
-                j += 1
-            count = (i - j + 1)
-            if count > 0:
-                smooth_rates.append(float(count))
+        smooth_rates = smoothed_packet_rates(all_ts)
         agg_pps_smooth = (percentile(smooth_rates, 50), percentile(smooth_rates, 95), percentile(smooth_rates, 99), stddev(smooth_rates))
 
         lines.append(
@@ -369,13 +333,6 @@ class Aggregator:
             f"  Smoothed PPS (1s window)     P50/P95/P99/std={fmt(agg_pps_smooth[0])}/{fmt(agg_pps_smooth[1])}/{fmt(agg_pps_smooth[2])}/{fmt(agg_pps_smooth[3])}"
         )
         return "\n".join(lines)
-
-
-def stddev(xs):
-    if not xs:
-        return None
-    m = sum(xs) / len(xs)
-    return (sum((x - m) ** 2 for x in xs) / len(xs)) ** 0.5
 
 
 def fmt(v):
@@ -992,270 +949,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-
-# ===== Metrics Aggregator =====
-MAGIC = b"MTP1"
-
-
-def percentile(data, p):
-    if not data:
-        return None
-    if p <= 0:
-        return float(min(data))
-    if p >= 100:
-        return float(max(data))
-    s = sorted(data)
-    k = (len(s) - 1) * (p / 100.0)
-    f = math.floor(k)
-    c = math.ceil(k)
-    if f == c:
-        return float(s[int(k)])
-    d0 = s[int(f)] * (c - k)
-    d1 = s[int(c)] * (k - f)
-    return float(d0 + d1)
-
-
-class FlowStats:
-    __slots__ = (
-        "mode",
-        "packets",
-        "bytes",
-        "first_ns",
-        "last_ns",
-        "last_arrival_ns",
-        "ipa_ms",
-        "last_transit_ms",
-        "jitter_samples_ms",
-        "rfc_jitter_ms",
-        "seq_expected",
-        "lost",
-        "reordered",
-        "last_seq"
-    )
-
-    def __init__(self, mode):
-        self.mode = mode
-        self.packets = 0
-        self.bytes = 0
-        self.first_ns = 0
-        self.last_ns = 0
-        self.last_arrival_ns = None
-        self.ipa_ms = deque(maxlen=5000)
-        self.last_transit_ms = None
-        self.jitter_samples_ms = deque(maxlen=5000)
-        self.rfc_jitter_ms = 0.0
-        self.seq_expected = None
-        self.lost = 0
-        self.reordered = 0
-        self.last_seq = None
-
-    def on_packet(self, seq, send_ns, recv_ns, length):
-        self.packets += 1
-        self.bytes += length
-        if self.first_ns == 0:
-            self.first_ns = recv_ns
-        self.last_ns = recv_ns
-
-        # IPA
-        if self.last_arrival_ns is not None:
-            self.ipa_ms.append(max(0.0, (recv_ns - self.last_arrival_ns) / 1e6))
-        self.last_arrival_ns = recv_ns
-
-        # Transit time using client send timestamp (ms)
-        transit_ms = (recv_ns - send_ns) / 1e6
-        if self.last_transit_ms is not None:
-            dt = abs(transit_ms - self.last_transit_ms)
-            self.jitter_samples_ms.append(dt)
-            # RFC3550 jitter estimator (ms)
-            self.rfc_jitter_ms += (dt - self.rfc_jitter_ms) / 16.0
-        self.last_transit_ms = transit_ms
-
-        # Loss / reordering (seq tracking)
-        if self.seq_expected is None:
-            self.seq_expected = seq + 1
-            self.last_seq = seq
-        else:
-            if seq == self.seq_expected:
-                self.seq_expected += 1
-            elif seq > self.seq_expected:
-                self.lost += (seq - self.seq_expected)
-                self.seq_expected = seq + 1
-            else:  # seq < expected
-                self.reordered += 1
-            self.last_seq = seq
-
-
-class Aggregator:
-    def __init__(self):
-        self.flows = {}  # key -> FlowStats
-
-    def _parse(self, data):
-        # Expect MAGIC + ver(1)+mode(1)+seq(8)+send_ns(8)
-        if len(data) < 22 or data[:4] != MAGIC:
-            return None
-        ver = data[4]
-        mode = data[5]
-        try:
-            # big endian
-            seq = int.from_bytes(data[6:14], "big")
-            send_ns = int.from_bytes(data[14:22], "big")
-        except Exception:
-            return None
-        return ver, mode, seq, send_ns
-
-    def on_packet(self, udp_name, data, addr):
-        parsed = self._parse(data)
-        now_ns = time.time_ns()
-        if not parsed:
-            return
-        ver, mode, seq, send_ns = parsed
-        # Normalize addr key (host, port)
-        if isinstance(addr, tuple) and len(addr) >= 2:
-            host = addr[0]
-            port = addr[1]
-        else:
-            host = str(addr)
-            port = 0
-        key = (host, port, mode)
-        fs = self.flows.get(key)
-        if fs is None:
-            fs = FlowStats(mode)
-            self.flows[key] = fs
-        fs.on_packet(seq, send_ns, now_ns, len(data))
-
-    def render_summary(self, now_ns, idle_ttl_s=10.0, silent_when_idle=False):
-        # Determine active flows within TTL and prune very stale ones
-        ttl_ns = int(idle_ttl_s * 1e9)
-        active = []
-        prune = []
-        for k, fs in self.flows.items():
-            if fs.last_ns and (now_ns - fs.last_ns) <= ttl_ns:
-                active.append((k, fs))
-            elif fs.last_ns and (now_ns - fs.last_ns) > 10 * ttl_ns:
-                prune.append(k)
-        for k in prune:
-            self.flows.pop(k, None)
-
-        if not active:
-            if silent_when_idle:
-                return ""
-            return "[server] idle (no active flows)"
-
-        lines = []
-        lines.append("=== Server Media Stats ===")
-        if self.header_lines:
-            lines.extend(self.header_lines)
-        lines.append(f"Active flows: {len(active)} (TTL {idle_ttl_s:.0f}s)")
-        # Show up to 8 busiest active flows by bytes
-        flows_sorted = sorted(active, key=lambda kv: kv[1].bytes, reverse=True)[:8]
-        for (host, port, mode), fs in flows_sorted:
-            elapsed = max(1e-9, (fs.last_ns - fs.first_ns) / 1e9) if fs.first_ns and fs.last_ns else 0.0
-            kbps_in = (fs.bytes * 8) / 1000.0 / elapsed if elapsed > 0 else 0.0
-            ipa_p50 = percentile(list(fs.ipa_ms), 50)
-            ipa_p95 = percentile(list(fs.ipa_ms), 95)
-            ipa_p99 = percentile(list(fs.ipa_ms), 99)
-            jit_p50 = percentile(list(fs.jitter_samples_ms), 50)
-            jit_p95 = percentile(list(fs.jitter_samples_ms), 95)
-            jit_p99 = percentile(list(fs.jitter_samples_ms), 99)
-            total_seen = fs.packets + fs.lost
-            loss_pct = (fs.lost / total_seen * 100.0) if total_seen > 0 else 0.0
-            # Burst loss and reorder depth
-            burst_p50 = percentile(list(fs.loss_bursts), 50)
-            burst_p95 = percentile(list(fs.loss_bursts), 95)
-            burst_max = max(fs.loss_bursts) if fs.loss_bursts else None
-            rord_p50 = percentile(list(fs.reorder_depths), 50)
-            rord_p95 = percentile(list(fs.reorder_depths), 95)
-            rord_max = max(fs.reorder_depths) if fs.reorder_depths else None
-            # PPS stability
-            pps_p50 = percentile(list(fs.pps_series), 50)
-            pps_p95 = percentile(list(fs.pps_series), 95)
-            pps_p99 = percentile(list(fs.pps_series), 99)
-            pps_std = stddev(list(fs.pps_series))
-            lines.append(f"- Flow: {host}:{port} mode={mode}")
-            lines.append(
-                f"  - Packets: {fs.packets}"
-            )
-            # Align with client ordering
-            lines.append("  - Latency (ms): P50/P95/P99 = n/a/n/a/n/a")
-            lines.append("  - RTT (ms):     P50/P95/P99 = n/a/n/a/n/a")
-            lines.append(
-                f"  - Jitter (ms):  P50/P95/P99 = {fmt(jit_p50)}/{fmt(jit_p95)}/{fmt(jit_p99)}, RFC3550={fs.rfc_jitter_ms:.2f}"
-            )
-            lines.append(
-                f"  - IPA (ms):     P50/P95/P99 = {fmt(ipa_p50)}/{fmt(ipa_p95)}/{fmt(ipa_p99)}"
-            )
-            lines.append(f"  - Throughput (kbps): in={kbps_in:.1f} out={kbps_out:.1f}")
-            # Loss burst and reorder depth are not meaningful on a reflector; omit
-            lines.append(
-                f"  - PPS:          P50/P95/P99/std = {fmt(pps_p50)}/{fmt(pps_p95)}/{fmt(pps_p99)}/{fmt(pps_std)}"
-            )
-            lines.append(f"  - Duplicates: {fs.duplicates}")
-
-        # Aggregate across active flows
-        total_pkts = 0
-        total_lost = 0
-        total_reordered = 0
-        total_duplicates = 0
-        total_bytes = 0
-        total_bytes_out = 0
-        g_first = None
-        g_last = None
-        all_ipa = []
-        all_jit = []
-        all_bursts = []
-        all_rdepths = []
-        all_pps = []
-        for _, fs in active:
-            total_pkts += fs.packets
-            total_lost += fs.lost
-            total_reordered += fs.reordered
-            total_duplicates += fs.duplicates
-            total_bytes += fs.bytes
-            total_bytes_out += getattr(fs, 'bytes_out', 0)
-            if fs.first_ns:
-                g_first = fs.first_ns if g_first is None else min(g_first, fs.first_ns)
-            if fs.last_ns:
-                g_last = fs.last_ns if g_last is None else max(g_last, fs.last_ns)
-            all_ipa.extend(list(fs.ipa_ms))
-            all_jit.extend(list(fs.jitter_samples_ms))
-            all_bursts.extend(list(fs.loss_bursts))
-            all_rdepths.extend(list(fs.reorder_depths))
-            all_pps.extend(list(fs.pps_series))
-
-        elapsed = max(1e-9, (g_last - g_first) / 1e9) if g_first and g_last else 0.0
-        in_kbps = (total_bytes * 8) / 1000.0 / elapsed if elapsed > 0 else 0.0
-        out_kbps = (total_bytes_out * 8) / 1000.0 / elapsed if elapsed > 0 else 0.0
-        agg_loss_pct = (total_lost / (total_pkts + total_lost) * 100.0) if (total_pkts + total_lost) > 0 else 0.0
-        agg_ipa = (percentile(all_ipa, 50), percentile(all_ipa, 95), percentile(all_ipa, 99))
-        agg_jit = (percentile(all_jit, 50), percentile(all_jit, 95), percentile(all_jit, 99))
-        agg_burst = (percentile(all_bursts, 50), percentile(all_bursts, 95), max(all_bursts) if all_bursts else None)
-        agg_rdepth = (percentile(all_rdepths, 50), percentile(all_rdepths, 95), max(all_rdepths) if all_rdepths else None)
-        agg_pps = (percentile(all_pps, 50), percentile(all_pps, 95), percentile(all_pps, 99), stddev(all_pps))
-
-        # If only one active flow, aggregate equals that flow; suppress duplicate
-        if len(active) == 1:
-            return "\n".join(lines)
-
-        lines.append("Aggregate:")
-        lines.append(
-            f"  - Packets: {total_pkts}"
-        )
-        lines.append("  - Latency (ms): P50/P95/P99 = n/a/n/a/n/a")
-        lines.append("  - RTT (ms):     P50/P95/P99 = n/a/n/a/n/a")
-        lines.append(
-            f"  - Jitter (ms):  P50/P95/P99 = {fmt(agg_jit[0])}/{fmt(agg_jit[1])}/{fmt(agg_jit[2])}"
-        )
-        lines.append(
-            f"  - IPA (ms):     P50/P95/P99 = {fmt(agg_ipa[0])}/{fmt(agg_ipa[1])}/{fmt(agg_ipa[2])}"
-        )
-        lines.append(f"  - Throughput (kbps): in={in_kbps:.1f} out={out_kbps:.1f}")
-        # Omit aggregate loss burst and reorder depth on reflector
-        lines.append(
-            f"  - PPS:          P50/P95/P99/std = {fmt(agg_pps[0])}/{fmt(agg_pps[1])}/{fmt(agg_pps[2])}/{fmt(agg_pps[3])}"
-        )
-        lines.append(f"  - Duplicates: {total_duplicates}")
-        return "\n".join(lines)
-
-
-def fmt(v):
-    return "n/a" if v is None else f"{v:.2f}"
