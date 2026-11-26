@@ -83,19 +83,32 @@ async fn binary_non_utf8_handshake_is_survived() {
 }
 
 #[tokio::test]
-async fn oversized_line_is_survived() {
+async fn oversized_line_closes_connection_and_server_survives() {
+    // Spec (B3): a control line > 64 KiB closes the connection (like Python's LimitOverrun).
     let (server, _l) = start().await;
     let tcp = TcpStream::connect(server.tcp_addrs[0]).await.unwrap();
-    let (rd, mut wr) = tcp.into_split();
+    let (mut rd, mut wr) = tcp.into_split();
     let mut big = vec![b'a'; 200_000];
     big.push(b'\n');
-    // The server may stop reading mid-way; ignore a write error from that.
+    // The server may stop reading mid-way; a write error from that is expected.
     let writer = tokio::spawn(async move {
         let _ = wr.write_all(&big).await;
         wr
     });
-    let mut rd = BufReader::new(rd);
-    let _ = read_resp(&mut rd).await;
+    // Connection must end (EOF or reset) without a valid response line.
+    let mut got = Vec::new();
+    let res = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut b = [0u8; 4096];
+        loop {
+            match rd.read(&mut b).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got.extend_from_slice(&b[..n]),
+            }
+        }
+    })
+    .await;
+    assert!(res.is_ok(), "server did not close the connection");
+    assert!(!got.contains(&b'\n') || serde_json::from_slice::<HelloResp>(&got).is_err(), "got a hello response: {got:?}");
     drop(writer);
     let (r, _a, _b) = hello(&server, "{\"mode\":\"audio\"}\n").await;
     assert!(r.ok);
