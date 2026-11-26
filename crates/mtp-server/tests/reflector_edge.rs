@@ -283,3 +283,22 @@ async fn client_udp_port_junk_is_ignored_not_fatal() {
     wr.write_all(b"{\"path_update\":{\"client_udp_port\":4321}}\n").await.unwrap();
     wait_line(&lines, "reported_udp=4321").await;
 }
+
+#[tokio::test]
+async fn string_client_udp_port_follows_python_int_semantics() {
+    let (server, lines) = start().await;
+    let addr = server.tcp_addrs[0];
+    // Python int("5000.0") / int("1e3") raise -> rejected (ignored); int("5001") ok.
+    for bad in ["\"5000.0\"", "\"1e3\""] {
+        let (r, _rd, mut wr) = hello_on(addr, "{\"mode\":\"audio\"}\n").await;
+        assert!(r.ok);
+        wr.write_all(format!("{{\"path_update\":{{\"client_udp_port\":{bad}}}}}\n").as_bytes()).await.unwrap();
+        // sync point: a following valid update is seen; the bad one must not have been
+        wr.write_all(b"{\"path_update\":{\"client_udp_port\":\"5001\"}}\n").await.unwrap();
+        wait_line(&lines, "reported_udp=5001").await;
+        let all = lines.lock().unwrap().join("\n");
+        assert!(!all.contains("reported_udp=5000") && !all.contains("reported_udp=1000"), "{bad}: {all}");
+    }
+    let (r, _rd, _wr) = hello_on(addr, "{\"mode\":\"audio\",\"client_udp_port\":\"5000.0\"}\n").await;
+    assert!(r.ok);
+}
