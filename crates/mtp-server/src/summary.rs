@@ -150,52 +150,111 @@ fn pps_json(d: &[f64]) -> Value {
     json!({"p50": a, "p95": b, "p99": c, "std": stddev(d)})
 }
 
-/// Machine-readable summary; `None` when idle and `silent_when_idle`.
-pub fn generate_summary_json(agg: &Aggregator, now_ns: u64, idle_ttl_s: f64, silent_when_idle: bool) -> Option<Value> {
+/// Optional exact-match filters on a flow's remote host / UDP port.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct Filter {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+}
+
+impl Filter {
+    fn matches(&self, key: &FlowKey) -> bool {
+        self.host.as_deref().is_none_or(|h| h == key.0) && self.port.is_none_or(|p| p == key.1)
+    }
+}
+
+/// Owned copy of what the JSON needs from one flow, so the aggregator lock can
+/// be released before any percentile work is done.
+#[derive(Debug, Clone)]
+pub struct FlowSnap {
+    host: String,
+    port: u16,
+    mode: u8,
+    packets: u64,
+    duplicates: u64,
+    bytes: u64,
+    bytes_out: u64,
+    first_ns: Option<u64>,
+    last_ns: Option<u64>,
+    kbps_in: f64,
+    kbps_out: f64,
+    rfc_jitter_ms: f64,
+    ipa: Vec<f64>,
+    jit: Vec<f64>,
+    pps: Vec<f64>,
+}
+
+/// Copy the (up to eight) most active matching flows out of the aggregator.
+pub fn snapshot_flows(agg: &Aggregator, now_ns: u64, idle_ttl_s: f64, filter: &Filter) -> Vec<FlowSnap> {
     let mut active = active_flows(agg, now_ns, ttl_to_ns(idle_ttl_s));
-    if active.is_empty() {
+    active.retain(|(k, _)| filter.matches(k));
+    by_bytes_desc(&mut active);
+    active
+        .iter()
+        .take(MAX_FLOWS)
+        .map(|((host, port, mode), fs)| FlowSnap {
+            host: host.clone(),
+            port: *port,
+            mode: *mode,
+            packets: fs.packets,
+            duplicates: fs.duplicates,
+            bytes: fs.bytes,
+            bytes_out: fs.bytes_out,
+            first_ns: fs.first_ns,
+            last_ns: fs.last_ns,
+            kbps_in: fs.kbps_in(),
+            kbps_out: fs.kbps_out(),
+            rfc_jitter_ms: fs.rfc_jitter_ms,
+            ipa: vec(&fs.ipa_ms),
+            jit: vec(&fs.jitter_samples_ms),
+            pps: vec(&fs.pps_series),
+        })
+        .collect()
+}
+
+/// Per-flow JSON object.
+pub fn flow_json(f: &FlowSnap) -> Value {
+    let mut jit_obj = q_json(&f.jit);
+    jit_obj["rfc3550"] = json!(f.rfc_jitter_ms);
+    json!({
+        "remote": f.host,
+        "udp_port": f.port,
+        "mode": f.mode,
+        "packets": f.packets,
+        "duplicates": f.duplicates,
+        "throughput_kbps": {"in": f.kbps_in, "out": f.kbps_out},
+        "ipa_ms": q_json(&f.ipa),
+        "jitter_ms": jit_obj,
+        "pps": pps_json(&f.pps),
+    })
+}
+
+/// Build the summary JSON from a snapshot; `None` when empty and `silent_when_idle`.
+pub fn summary_json_from(flows: &[FlowSnap], silent_when_idle: bool) -> Option<Value> {
+    if flows.is_empty() {
         return if silent_when_idle { None } else { Some(json!({"idle": true, "active_flows": []})) };
     }
-    by_bytes_desc(&mut active);
-
-    let mut flows = vec![];
     let (mut bytes, mut bytes_out, mut pkts, mut dups) = (0u64, 0u64, 0u64, 0u64);
     let (mut first, mut last): (Option<u64>, Option<u64>) = (None, None);
     let (mut ipa_all, mut jit_all, mut pps_all) = (vec![], vec![], vec![]);
 
     // Like the Python, the aggregate covers only the flows that are listed.
-    for ((host, port, mode), fs) in active.iter().take(MAX_FLOWS) {
-        let ipa = vec(&fs.ipa_ms);
-        let jit = vec(&fs.jitter_samples_ms);
-        let pps = vec(&fs.pps_series);
-        let mut jit_obj = q_json(&jit);
-        jit_obj["rfc3550"] = json!(fs.rfc_jitter_ms);
-        flows.push(json!({
-            "remote": host,
-            "udp_port": port,
-            "mode": mode,
-            "packets": fs.packets,
-            "duplicates": fs.duplicates,
-            "throughput_kbps": {"in": fs.kbps_in(), "out": fs.kbps_out()},
-            "ipa_ms": q_json(&ipa),
-            "jitter_ms": jit_obj,
-            "pps": pps_json(&pps),
-        }));
-        bytes += fs.bytes;
-        bytes_out += fs.bytes_out;
-        pkts += fs.packets;
-        dups += fs.duplicates;
-        first = min_opt(first, fs.first_ns);
-        last = max_opt(last, fs.last_ns);
-        ipa_all.extend(ipa);
-        jit_all.extend(jit);
-        pps_all.extend(pps);
+    for f in flows {
+        bytes = bytes.saturating_add(f.bytes);
+        bytes_out = bytes_out.saturating_add(f.bytes_out);
+        pkts = pkts.saturating_add(f.packets);
+        dups = dups.saturating_add(f.duplicates);
+        first = min_opt(first, f.first_ns);
+        last = max_opt(last, f.last_ns);
+        ipa_all.extend(f.ipa.iter().copied());
+        jit_all.extend(f.jit.iter().copied());
+        pps_all.extend(f.pps.iter().copied());
     }
     let elapsed = span_s(first, last);
     Some(json!({
         "idle": false,
         "active_count": flows.len(),
-        "flows": flows,
+        "flows": flows.iter().map(flow_json).collect::<Vec<_>>(),
         "aggregate": {
             "packets": pkts,
             "duplicates": dups,
@@ -205,6 +264,23 @@ pub fn generate_summary_json(agg: &Aggregator, now_ns: u64, idle_ttl_s: f64, sil
             "pps": pps_json(&pps_all),
         },
     }))
+}
+
+/// Machine-readable summary restricted to flows matching `filter`; `None` when
+/// idle and `silent_when_idle`.
+pub fn generate_summary_json_filtered(
+    agg: &Aggregator,
+    now_ns: u64,
+    idle_ttl_s: f64,
+    silent_when_idle: bool,
+    filter: &Filter,
+) -> Option<Value> {
+    summary_json_from(&snapshot_flows(agg, now_ns, idle_ttl_s, filter), silent_when_idle)
+}
+
+/// Machine-readable summary; `None` when idle and `silent_when_idle`.
+pub fn generate_summary_json(agg: &Aggregator, now_ns: u64, idle_ttl_s: f64, silent_when_idle: bool) -> Option<Value> {
+    generate_summary_json_filtered(agg, now_ns, idle_ttl_s, silent_when_idle, &Filter::default())
 }
 
 #[cfg(test)]
@@ -259,6 +335,27 @@ mod tests {
         assert_eq!(v["flows"][0]["mode"], 1);
         assert!(v["flows"][0]["jitter_ms"]["rfc3550"].is_number());
         assert_eq!(v["aggregate"]["packets"], 50);
+    }
+
+    #[test]
+    fn json_filters() {
+        let a = agg_with(&[("h", 1, 50), ("g", 2, 10), ("g", 3, 5)]);
+        let now = 2_000_000_000;
+        let f = |host: Option<&str>, port| Filter { host: host.map(String::from), port };
+        let v = generate_summary_json_filtered(&a, now, 10.0, false, &f(Some("g"), None)).unwrap();
+        assert_eq!(v["active_count"], 2);
+        assert_eq!(v["aggregate"]["packets"], 15);
+        let v = generate_summary_json_filtered(&a, now, 10.0, false, &f(None, Some(2))).unwrap();
+        assert_eq!(v["active_count"], 1);
+        assert_eq!(v["flows"][0]["remote"], "g");
+        let v = generate_summary_json_filtered(&a, now, 10.0, false, &f(Some("h"), Some(2))).unwrap();
+        assert_eq!(v, json!({"idle": true, "active_flows": []}));
+        assert!(generate_summary_json_filtered(&a, now, 10.0, true, &f(Some("zz"), None)).is_none());
+        // unfiltered matches the old entry point
+        assert_eq!(
+            generate_summary_json(&a, now, 10.0, false),
+            generate_summary_json_filtered(&a, now, 10.0, false, &Filter::default())
+        );
     }
 
     #[test]
