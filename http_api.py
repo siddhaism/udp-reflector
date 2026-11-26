@@ -57,6 +57,8 @@ async def _read_request(reader):
         raise _HttpError(400, "incomplete request")
     if len(line) > MAX_REQUEST_LINE:
         raise _HttpError(414, "request line too long")
+    if any(b >= 0x80 for b in line):
+        raise _HttpError(400, "non-ASCII bytes in request line")
     parts = line.decode("latin-1").rstrip("\r\n").split(" ")
     if len(parts) != 3 or not parts[2].startswith("HTTP/"):
         raise _HttpError(400, "malformed request line")

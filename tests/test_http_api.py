@@ -255,3 +255,13 @@ def test_cache_unfiltered_key_survives_junk_hosts():
         assert len(calls) == n
         srv.close()
     run(go())
+
+
+def test_raw_non_ascii_request_line_is_400():
+    async def go():
+        srv, port = await start(server.Aggregator())
+        for path in ("/flows", "/summary", "/healthz"):
+            st, _, b = await raw(port, b"GET " + path.encode() + b"?host=\xff\xfe HTTP/1.1\r\nHost: x\r\n\r\n")
+            assert st == 400 and "error" in b, path
+        srv.close()
+    run(go())
