@@ -45,8 +45,9 @@ pub struct Config {
     /// Maximum concurrent TCP control connections (extras are closed)
     #[arg(long, default_value_t = 256)]
     pub max_control_conns: usize,
-    /// Seconds a control connection may stay silent before it is closed (0 disables)
-    #[arg(long, default_value_t = 300.0)]
+    /// Seconds a control connection may stay silent before it is closed (0 disables, the default,
+    /// matching the Python server; clients send nothing after the hello except path_update)
+    #[arg(long, default_value_t = 0.0)]
     pub control_idle_timeout: f64,
     /// Enable the read-only REST API on this TCP port (disabled when unset)
     #[arg(long)]
