@@ -51,7 +51,9 @@ impl Server {
             format!("UDP audio: v4 {}:{} | v6 [{}]:{}", cfg.udp_host_v4, cfg.audio_port, cfg.udp_host_v6, cfg.audio_port),
             format!("UDP video: v4 {}:{} | v6 [{}]:{}", cfg.udp_host_v4, cfg.video_port, cfg.udp_host_v6, cfg.video_port),
         ];
-        let agg = Arc::new(Mutex::new(Aggregator::new(header_lines)));
+        let mut aggregator = Aggregator::new(header_lines);
+        aggregator.set_limits(cfg.max_flows, cfg.idle_ttl);
+        let agg = Arc::new(Mutex::new(aggregator));
 
         let audio = udp_sockets(&cfg.udp_host_v4, &cfg.udp_host_v6, cfg.audio_port)?;
         let video = udp_sockets(&cfg.udp_host_v4, &cfg.udp_host_v6, cfg.video_port)?;
@@ -79,14 +81,23 @@ impl Server {
         for s in audio.into_iter().chain(video) {
             tasks.push(tokio::spawn(reflector::reflect(Arc::new(s), agg.clone(), out.clone())));
         }
+        let conn_slots = Arc::new(tokio::sync::Semaphore::new(cfg.max_control_conns.max(1)));
         for l in tcp {
             let ctx = ctx.clone();
+            let conn_slots = conn_slots.clone();
             tasks.push(tokio::spawn(async move {
                 loop {
                     match l.accept().await {
-                        Ok((stream, _)) => {
-                            tokio::spawn(control::handle_control(stream, ctx.clone()));
-                        }
+                        Ok((stream, peer)) => match conn_slots.clone().try_acquire_owned() {
+                            Ok(permit) => {
+                                let ctx = ctx.clone();
+                                tokio::spawn(async move {
+                                    control::handle_control(stream, ctx).await;
+                                    drop(permit);
+                                });
+                            }
+                            Err(_) => eprintln!("[server] too many control connections; refusing {peer}"),
+                        },
                         Err(e) => {
                             eprintln!("[server] accept error: {e}");
                             tokio::time::sleep(Duration::from_millis(50)).await;

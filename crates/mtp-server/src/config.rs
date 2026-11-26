@@ -39,6 +39,15 @@ pub struct Config {
     /// Seconds of inactivity after which a flow is idle
     #[arg(long, default_value_t = 10.0)]
     pub idle_ttl: f64,
+    /// Maximum number of simultaneously tracked flows (oldest-idle evicted)
+    #[arg(long, default_value_t = crate::aggregator::DEFAULT_MAX_FLOWS)]
+    pub max_flows: usize,
+    /// Maximum concurrent TCP control connections (extras are closed)
+    #[arg(long, default_value_t = 256)]
+    pub max_control_conns: usize,
+    /// Seconds a control connection may stay silent before it is closed (0 disables)
+    #[arg(long, default_value_t = 300.0)]
+    pub control_idle_timeout: f64,
     /// Do not print when there are no active flows
     #[arg(long)]
     pub silent_when_idle: bool,

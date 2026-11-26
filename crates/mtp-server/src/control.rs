@@ -28,9 +28,21 @@ fn lock(m: &Mutex<Aggregator>) -> std::sync::MutexGuard<'_, Aggregator> {
 }
 
 /// Read one line (including `\n`) of at most `MAX_LINE` bytes; 0 means EOF.
-async fn read_line<R: AsyncBufReadExt + Unpin>(r: &mut R, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+async fn read_line<R: AsyncBufReadExt + Unpin>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+    idle_timeout_s: f64,
+) -> std::io::Result<usize> {
     buf.clear();
-    r.take(MAX_LINE).read_until(b'\n', buf).await
+    let mut limited = r.take(MAX_LINE);
+    let read = limited.read_until(b'\n', buf);
+    if idle_timeout_s > 0.0 && idle_timeout_s.is_finite() {
+        tokio::time::timeout(std::time::Duration::from_secs_f64(idle_timeout_s), read)
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "control connection idle timeout"))?
+    } else {
+        read.await
+    }
 }
 
 fn parse_json(line: &[u8]) -> Value {
@@ -73,7 +85,7 @@ async fn session(
     hello_to_resp_ms: &mut Option<f64>,
 ) -> std::io::Result<()> {
     let mut buf = Vec::new();
-    if read_line(rd, &mut buf).await? == 0 {
+    if read_line(rd, &mut buf, ctx.cfg.control_idle_timeout).await? == 0 {
         return Ok(());
     }
     let hello_rx_ns = now_ns();
@@ -120,7 +132,7 @@ async fn session(
 
     // Stay connected until the client closes; handle path updates meanwhile.
     loop {
-        if read_line(rd, &mut buf).await? == 0 {
+        if read_line(rd, &mut buf, ctx.cfg.control_idle_timeout).await? == 0 {
             return Ok(());
         }
         *bytes_in += buf.len();
@@ -172,5 +184,19 @@ fn final_stats(
                 "ts_ns": now_ns(),
             }),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn idle_read_times_out() {
+        let (_keep, srv) = tokio::io::duplex(64);
+        let mut rd = BufReader::new(srv);
+        let mut buf = Vec::new();
+        let err = read_line(&mut rd, &mut buf, 0.05).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 }
