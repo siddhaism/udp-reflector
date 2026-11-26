@@ -165,27 +165,39 @@ async fn active_summary_flows_and_filters() {
 }
 
 #[tokio::test]
-async fn flows_listing_is_bounded_and_server_handles_many_flows() {
-    // Builder's assumption: /flows capped at 8. Contract does not state a cap; just require
-    // the response is valid, and report the observed size.
+async fn flows_listing_is_top_8_by_bytes() {
     let (s, a) = start_http().await;
+    let mut ports = vec![];
     let mut cs = vec![];
-    for i in 0..12 {
+    for i in 0..12usize {
         let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        probe(&s, &c, i).await;
+        // distinct, deterministic byte totals: flow i sends one packet of 100 + 10*i bytes
+        let p = build_packet(Mode::Audio, 0, now_ns(), 100 + 10 * i).unwrap();
+        c.send_to(&p, s.audio_addrs[0]).await.unwrap();
+        assert_eq!(recv_echo(&c).await, p);
+        ports.push(c.local_addr().unwrap().port() as u64);
         cs.push(c);
     }
-    let mut n = 0;
+    let mut got: Vec<u64> = vec![];
     for _ in 0..500 {
         let f = get(a, "/flows").await.json();
-        n = f["flows"].as_array().unwrap().len();
-        if n > 0 {
+        let arr = f["flows"].as_array().unwrap();
+        got = arr
+            .iter()
+            .filter_map(|e| e.as_object().unwrap().values().find_map(|v| v.as_u64().filter(|p| ports.contains(p))))
+            .collect();
+        if got.len() == 8 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(n >= 1);
-    eprintln!("NOTE: /flows returned {n} entries with 12 active flows");
+    let mut want: Vec<u64> = ports[4..].to_vec();
+    want.sort();
+    got.sort();
+    assert_eq!(got, want, "expected the 8 highest-by-bytes flows");
+    let d = get(a, "/summary").await.json();
+    assert!(d["active_count"].as_u64().unwrap() <= 8, "{d}");
+    assert!(d["flows"].as_array().unwrap().len() <= 8);
 }
 
 // ---------------- 400 ----------------
@@ -292,15 +304,15 @@ async fn non_get_on_unknown_path_status() {
 async fn long_request_line_414_and_big_headers_431() {
     let (_s, a) = start_http().await;
     let mut req = b"GET /".to_vec();
-    req.extend(std::iter::repeat(b'a').take(3000));
+    req.extend(std::iter::repeat_n(b'a', 3000));
     req.extend_from_slice(b" HTTP/1.1\r\nHost: x\r\n\r\n");
     assert_eq!(parse(&raw(a, &req).await).status, 414);
     let mut un = b"GET /healthz?".to_vec();
-    un.extend(std::iter::repeat(b'a').take(5000));
+    un.extend(std::iter::repeat_n(b'a', 5000));
     assert_eq!(parse(&raw(a, &un).await).status, 414);
 
     let mut h = b"GET /healthz HTTP/1.1\r\nX-Pad: ".to_vec();
-    h.extend(std::iter::repeat(b'a').take(9000));
+    h.extend(std::iter::repeat_n(b'a', 9000));
     h.extend_from_slice(b"\r\n\r\n");
     assert_eq!(parse(&raw(a, &h).await).status, 431);
     let mut many = b"GET /healthz HTTP/1.1\r\n".to_vec();
@@ -350,7 +362,6 @@ async fn garbage_targets_never_5xx() {
 }
 
 #[tokio::test]
-#[ignore = "BUG: `GET //[ HTTP/1.1` and `GET http://[ HTTP/1.1` return 404 {\"error\":\"not found\"}; contract (and Python urlsplit ValueError path) require 400"]
 async fn unbalanced_bracket_targets_are_400() {
     let (_s, a) = start_http().await;
     let mut failures = vec![];
@@ -442,12 +453,86 @@ async fn slow_partial_request_does_not_block_others() {
 }
 
 #[tokio::test]
-#[ignore = "SKIPPED: 5 s read timeout (408) is not configurable via Config; run manually with --ignored (takes ~5 s)"]
 async fn read_timeout_408() {
-    let (_s, a) = start_http().await;
-    let mut c = TcpStream::connect(a).await.unwrap();
+    let cfg = Config { http_port: Some(0), http_read_timeout: 0.3, ..local_cfg() };
+    let (out, _l) = Out::captured();
+    let s = Server::start(cfg, out).await.unwrap();
+    let mut c = TcpStream::connect(s.http_addr.unwrap()).await.unwrap();
     c.write_all(b"GET /heal").await.unwrap();
     let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(15), c.read_to_end(&mut buf)).await.unwrap().ok();
+    tokio::time::timeout(Duration::from_secs(10), c.read_to_end(&mut buf)).await.unwrap().ok();
     assert_eq!(parse(&buf).status, 408);
+}
+
+// ---------------- repair regressions ----------------
+
+#[tokio::test]
+async fn odd_header_lines_are_tolerated() {
+    let (_s, a) = start_http().await;
+    let r = parse(&raw(a, b"GET /healthz HTTP/1.1\r\nX-Bad: \xff\xfe\x80\r\nno-colon-here\r\n\r\n").await);
+    assert_eq!(r.status, 200);
+    let r = parse(&raw(a, b"GET /healthz HTTP/1.1\r\n\xff\xff\r\n\r\n").await);
+    assert_eq!(r.status, 200);
+}
+
+#[tokio::test]
+async fn empty_pair_ok_but_blank_value_400() {
+    let (_s, a) = start_http().await;
+    assert_eq!(get(a, "/flows?host=127.0.0.1&").await.status, 200);
+    assert_eq!(get(a, "/flows?&host=127.0.0.1").await.status, 200);
+    assert_eq!(get(a, "/flows?").await.status, 200);
+    assert_eq!(get(a, "/flows?host=").await.status, 400);
+    assert_eq!(get(a, "/flows?host=127.0.0.1&port=").await.status, 400);
+}
+
+#[tokio::test]
+async fn single_long_header_line_is_431() {
+    let (_s, a) = start_http().await;
+    let mut h = b"GET /healthz HTTP/1.1\r\nX-Long: ".to_vec();
+    h.extend(std::iter::repeat_n(b'a', 2100));
+    h.extend_from_slice(b"\r\n\r\n");
+    assert_eq!(parse(&raw(a, &h).await).status, 431);
+}
+
+#[tokio::test]
+async fn http2_version_and_fragment_ok() {
+    let (_s, a) = start_http().await;
+    let r = parse(&raw(a, b"GET /healthz HTTP/2.0\r\nHost: x\r\n\r\n").await);
+    assert_eq!(r.status, 200);
+    assert_eq!(get(a, "/healthz#f").await.status, 200);
+}
+
+#[tokio::test]
+async fn request_line_exact_limit_boundary() {
+    let (_s, a) = start_http().await;
+    for (total, want) in [(2048usize, 200u16), (2049, 414)] {
+        // "GET /healthz?" + pad + " HTTP/1.1\r\n" == total bytes
+        let fixed = "GET /healthz? HTTP/1.1\r\n".len();
+        let mut req = format!("GET /healthz?{} HTTP/1.1\r\n", "a".repeat(total - fixed)).into_bytes();
+        assert_eq!(req.len(), total);
+        req.extend_from_slice(b"Host: x\r\n\r\n");
+        assert_eq!(parse(&raw(a, &req).await).status, want, "total {total}");
+    }
+}
+
+#[tokio::test]
+async fn many_junk_filters_do_not_corrupt_unfiltered_summary() {
+    let (s, a) = start_http().await;
+    let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    probe(&s, &c, 0).await;
+    for i in 0..200 {
+        let r = get(a, &format!("/summary?host=junk-{i}.example")).await;
+        assert_eq!(r.status, 200);
+        assert_eq!(r.json()["idle"], Value::Bool(true));
+    }
+    let mut d = Value::Null;
+    for _ in 0..500 {
+        d = get(a, "/summary").await.json();
+        if d["idle"] == Value::Bool(false) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(d["idle"], Value::Bool(false), "{d}");
+    assert_eq!(d["active_count"].as_u64(), Some(1));
 }
