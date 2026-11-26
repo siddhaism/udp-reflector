@@ -11,8 +11,12 @@ from urllib.parse import parse_qs, urlsplit
 MAX_REQUEST_LINE = 2048
 MAX_HEADER_BYTES = 8192
 READ_TIMEOUT_S = 5.0
+# Known limitation: this cap counts idle connections that have not yet sent a
+# request (up to read_timeout), so a client can hold all slots. Only suitable
+# on loopback or behind a firewall.
 MAX_CONNECTIONS = 64
 CACHE_TTL_S = 0.25
+CACHE_MAX_FILTERED = 64  # filtered keys kept (LRU); the unfiltered key is pinned
 _BAD_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
 _REASONS = {
@@ -157,11 +161,16 @@ def _cached(summary_fn, ttl, clock):
         now = clock()
         hit = cache.get((host, port))
         if hit is not None and now - hit[0] < ttl:
+            if (host, port) != (None, None):
+                cache[(host, port)] = cache.pop((host, port))  # LRU touch
             return hit[1]
         val = summary_fn(host, port)
-        if len(cache) >= 256:
-            cache.clear()
-        cache[(host, port)] = (now, val)
+        key = (host, port)
+        cache[key] = (now, val)
+        filtered = [k for k in cache if k != (None, None)]
+        # Pin the unfiltered key; evict oldest filtered keys beyond the cap.
+        for k in filtered[:max(0, len(filtered) - CACHE_MAX_FILTERED)]:
+            del cache[k]
         return val
     return fn
 

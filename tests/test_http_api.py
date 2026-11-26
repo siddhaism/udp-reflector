@@ -235,3 +235,23 @@ def test_connection_cap_503():
             w.close()
         srv.close()
     run(go())
+
+
+def test_cache_unfiltered_key_survives_junk_hosts():
+    async def go():
+        calls = []
+
+        def fn(h, p):
+            calls.append((h, p))
+            return {"idle": True, "active_flows": []}
+
+        srv = await start_http_server(fn, "127.0.0.1", 0, clock=lambda: 100.0)
+        port = srv.sockets[0].getsockname()[1]
+        await get(port, "/summary")
+        for i in range(200):
+            await get(port, f"/summary?host=junk{i}")
+        n = len(calls)
+        await get(port, "/summary")
+        assert len(calls) == n
+        srv.close()
+    run(go())
