@@ -54,6 +54,9 @@ pub struct Config {
     /// Bind address for the REST API
     #[arg(long, default_value = "127.0.0.1")]
     pub http_host: String,
+    /// Seconds allowed to receive a full REST request head before 408
+    #[arg(long, default_value_t = 5.0)]
+    pub http_read_timeout: f64,
     /// Do not print when there are no active flows
     #[arg(long)]
     pub silent_when_idle: bool,
