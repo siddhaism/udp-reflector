@@ -36,17 +36,47 @@ async fn read_line<R: AsyncBufReadExt + Unpin>(
     buf.clear();
     let mut limited = r.take(MAX_LINE);
     let read = limited.read_until(b'\n', buf);
-    if idle_timeout_s > 0.0 && idle_timeout_s.is_finite() {
+    let n = if idle_timeout_s > 0.0 && idle_timeout_s.is_finite() {
         tokio::time::timeout(std::time::Duration::from_secs_f64(idle_timeout_s), read)
             .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "control connection idle timeout"))?
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "control connection idle timeout"))??
     } else {
-        read.await
+        read.await?
+    };
+    // A full buffer with no newline means an over-long line: close rather than
+    // treat the remainder as a new message.
+    if n as u64 >= MAX_LINE && buf.last() != Some(&b'\n') {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "control line too long"));
     }
+    Ok(n)
+}
+
+/// Decode like Python's `decode("utf-8", errors="ignore")`: invalid bytes are dropped.
+fn decode_ignore(line: &[u8]) -> String {
+    let mut out = String::with_capacity(line.len());
+    for chunk in line.utf8_chunks() {
+        out.push_str(chunk.valid());
+    }
+    out
 }
 
 fn parse_json(line: &[u8]) -> Value {
-    serde_json::from_slice(line).unwrap_or(Value::Null)
+    serde_json::from_str(&decode_ignore(line)).unwrap_or(Value::Null)
+}
+
+/// Accept a port given as an integer, an integral float, or a numeric string.
+fn port_value(v: &Value) -> Option<i64> {
+    fn from_f64(f: f64) -> Option<i64> {
+        (f.is_finite() && f.fract() == 0.0 && f.abs() < 9.0e15).then_some(f as i64)
+    }
+    match v {
+        Value::Number(n) => n.as_i64().or_else(|| n.as_f64().and_then(from_f64)),
+        Value::String(s) => {
+            let t = s.trim();
+            t.parse::<i64>().ok().or_else(|| t.parse::<f64>().ok().and_then(from_f64))
+        }
+        _ => None,
+    }
 }
 
 pub async fn handle_control(stream: TcpStream, ctx: Arc<Ctx>) {
@@ -93,7 +123,7 @@ async fn session(
     let hello = parse_json(&buf);
 
     let mode = hello.get("mode").and_then(Value::as_str).unwrap_or("audio").to_string();
-    let client_udp_port = hello.get("client_udp_port").and_then(Value::as_i64);
+    let client_udp_port = hello.get("client_udp_port").and_then(port_value);
     // Must be known before the connection line is built (the Python read it first).
     let server_udp_port = if mode == "video" { ctx.video_port } else { ctx.audio_port };
 
@@ -137,7 +167,7 @@ async fn session(
         }
         *bytes_in += buf.len();
         let msg = parse_json(&buf);
-        if let Some(port) = msg.pointer("/path_update/client_udp_port").and_then(Value::as_i64) {
+        if let Some(port) = msg.pointer("/path_update/client_udp_port").and_then(port_value) {
             lock(&ctx.agg).set_expected_udp_port(peer_ip, port);
             ctx.out.line(format!("[server] Control: path_update from {peer_ip} reported_udp={port}"));
         }
@@ -198,5 +228,42 @@ mod tests {
         let mut buf = Vec::new();
         let err = read_line(&mut rd, &mut buf, 0.05).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn port_forms() {
+        use serde_json::json;
+        assert_eq!(port_value(&json!(5000)), Some(5000));
+        assert_eq!(port_value(&json!("5000")), Some(5000));
+        assert_eq!(port_value(&json!(5000.0)), Some(5000));
+        assert_eq!(port_value(&json!("5000.0")), Some(5000));
+        assert_eq!(port_value(&json!(5000.5)), None);
+        assert_eq!(port_value(&json!("abc")), None);
+        assert_eq!(port_value(&json!(null)), None);
+        assert_eq!(port_value(&json!(true)), None);
+    }
+
+    #[test]
+    fn invalid_utf8_is_dropped() {
+        let v = parse_json(b"{\"mode\":\"vi\xffdeo\"}\n");
+        assert_eq!(v["mode"], "video");
+    }
+
+    #[tokio::test]
+    async fn overlong_line_is_an_error() {
+        let data = vec![b'a'; MAX_LINE as usize + 10];
+        let mut rd = BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        let err = read_line(&mut rd, &mut buf, 0.0).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn max_size_line_with_newline_is_ok() {
+        let mut data = vec![b'a'; MAX_LINE as usize - 1];
+        data.push(b'\n');
+        let mut rd = BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        assert_eq!(read_line(&mut rd, &mut buf, 0.0).await.unwrap(), MAX_LINE as usize);
     }
 }
