@@ -48,6 +48,12 @@ pub struct Config {
     /// Seconds a control connection may stay silent before it is closed (0 disables)
     #[arg(long, default_value_t = 300.0)]
     pub control_idle_timeout: f64,
+    /// Enable the read-only REST API on this TCP port (disabled when unset)
+    #[arg(long)]
+    pub http_port: Option<u16>,
+    /// Bind address for the REST API
+    #[arg(long, default_value = "127.0.0.1")]
+    pub http_host: String,
     /// Do not print when there are no active flows
     #[arg(long)]
     pub silent_when_idle: bool,

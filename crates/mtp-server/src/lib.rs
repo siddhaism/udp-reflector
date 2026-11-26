@@ -4,6 +4,7 @@ pub mod aggregator;
 pub mod config;
 pub mod control;
 pub mod flow;
+pub mod http;
 pub mod net;
 pub mod reflector;
 pub mod summary;
@@ -27,6 +28,7 @@ pub struct Server {
     pub tcp_addrs: Vec<SocketAddr>,
     pub audio_addrs: Vec<SocketAddr>,
     pub video_addrs: Vec<SocketAddr>,
+    pub http_addr: Option<SocketAddr>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -106,6 +108,14 @@ impl Server {
                 }
             }));
         }
+        let mut http_addr = None;
+        if let Some(port) = cfg.http_port {
+            let l = TcpListener::bind((cfg.http_host.as_str(), port)).await?;
+            let addr = l.local_addr()?;
+            http_addr = Some(addr);
+            tasks.push(tokio::spawn(http::serve(l, http::HttpState::new(agg.clone(), cfg.idle_ttl))));
+            out.line(format!("[server] HTTP API listening on {addr}"));
+        }
         if cfg.periodic_stats {
             tasks.push(tokio::spawn(periodic_stats(cfg.clone(), agg.clone(), out.clone())));
         }
@@ -114,7 +124,7 @@ impl Server {
         out.line(format!("[server] UDP audio reflector on {}", fmt_addrs(&audio_addrs)));
         out.line(format!("[server] UDP video reflector on {}", fmt_addrs(&video_addrs)));
 
-        Ok(Server { aggregator: agg, tcp_addrs, audio_addrs, video_addrs, tasks })
+        Ok(Server { aggregator: agg, tcp_addrs, audio_addrs, video_addrs, http_addr, tasks })
     }
 
     /// Wait until every task has exited (normally never) or `stop` resolves.
