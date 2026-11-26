@@ -7,6 +7,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
+from http_api import start_http_server
 from metrics import percentile, smoothed_packet_rates, stddev
 
 # ===== Metrics Aggregator =====
@@ -855,6 +856,8 @@ async def main():
     ap.add_argument("--silent-when-idle", action="store_true", help="Do not print when no active flows in window")
     ap.add_argument("--json", action="store_true", help="Emit JSON lines for summaries (stdout)")
     ap.add_argument("--json-file", default=None, help="Append JSON lines to file path")
+    ap.add_argument("--http-port", type=int, default=None, help="Enable read-only REST API on this port (default: off)")
+    ap.add_argument("--http-host", default="127.0.0.1", help="REST API bind host (default: 127.0.0.1)")
 
     args = ap.parse_args()
 
@@ -902,6 +905,16 @@ async def main():
     print(f"[server] UDP audio reflector on v4 {args.udp_host_v4}:{args.audio_port} and v6 [{args.udp_host_v6}]:{args.audio_port}")
     print(f"[server] UDP video reflector on v4 {args.udp_host_v4}:{args.video_port} and v6 [{args.udp_host_v6}]:{args.video_port}")
 
+    http_server = None
+    if args.http_port is not None:
+        def _summary(host, port):
+            return generate_summary_json(
+                aggregator, time.time_ns(), idle_ttl_s=args.idle_ttl,
+                filter_host=host, filter_port=port,
+            )
+        http_server = await start_http_server(_summary, args.http_host, args.http_port)
+        print(f"[server] HTTP API listening on {args.http_host}:{http_server.sockets[0].getsockname()[1]}")
+
     async def serve_all():
         async def serve(s):
             async with s:
@@ -937,6 +950,8 @@ async def main():
     finally:
         if task is not None:
             task.cancel()
+        if http_server is not None:
+            http_server.close()
         for t in a_transports + v_transports:
             try:
                 t.close()
