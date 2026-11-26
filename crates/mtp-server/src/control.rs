@@ -64,17 +64,34 @@ fn parse_json(line: &[u8]) -> Value {
     serde_json::from_str(&decode_ignore(line)).unwrap_or(Value::Null)
 }
 
-/// Accept a port given as an integer, an integral float, or a numeric string.
+/// Python `int(str)`: optional whitespace and sign, digits with single underscores between them.
+fn py_int(s: &str) -> Option<i64> {
+    let t = s.trim();
+    let (neg, digits) = match t.as_bytes().first()? {
+        b'+' => (false, &t[1..]),
+        b'-' => (true, &t[1..]),
+        _ => (false, t),
+    };
+    let ok = !digits.is_empty()
+        && !digits.starts_with('_')
+        && !digits.ends_with('_')
+        && !digits.contains("__")
+        && digits.bytes().all(|c| c.is_ascii_digit() || c == b'_');
+    if !ok {
+        return None;
+    }
+    let n: i64 = digits.replace('_', "").parse().ok()?;
+    Some(if neg { -n } else { n })
+}
+
+/// Accept a port given as a JSON integer, an integral float, or an integer string.
 fn port_value(v: &Value) -> Option<i64> {
     fn from_f64(f: f64) -> Option<i64> {
         (f.is_finite() && f.fract() == 0.0 && f.abs() < 9.0e15).then_some(f as i64)
     }
     match v {
         Value::Number(n) => n.as_i64().or_else(|| n.as_f64().and_then(from_f64)),
-        Value::String(s) => {
-            let t = s.trim();
-            t.parse::<i64>().ok().or_else(|| t.parse::<f64>().ok().and_then(from_f64))
-        }
+        Value::String(s) => py_int(s),
         _ => None,
     }
 }
@@ -236,7 +253,12 @@ mod tests {
         assert_eq!(port_value(&json!(5000)), Some(5000));
         assert_eq!(port_value(&json!("5000")), Some(5000));
         assert_eq!(port_value(&json!(5000.0)), Some(5000));
-        assert_eq!(port_value(&json!("5000.0")), Some(5000));
+        assert_eq!(port_value(&json!("5000.0")), None);
+        assert_eq!(port_value(&json!("1e3")), None);
+        assert_eq!(port_value(&json!(" +5000 ")), Some(5000));
+        assert_eq!(port_value(&json!("5_000")), Some(5000));
+        assert_eq!(port_value(&json!("5__0")), None);
+        assert_eq!(port_value(&json!("")), None);
         assert_eq!(port_value(&json!(5000.5)), None);
         assert_eq!(port_value(&json!("abc")), None);
         assert_eq!(port_value(&json!(null)), None);

@@ -113,7 +113,11 @@ impl Server {
             let l = TcpListener::bind((cfg.http_host.as_str(), port)).await?;
             let addr = l.local_addr()?;
             http_addr = Some(addr);
-            tasks.push(tokio::spawn(http::serve(l, http::HttpState::new(agg.clone(), cfg.idle_ttl))));
+            tasks.push(tokio::spawn(http::serve(l, http::HttpState::with_read_timeout(
+                agg.clone(),
+                cfg.idle_ttl,
+                Duration::from_secs_f64(cfg.http_read_timeout.clamp(0.01, 3600.0)),
+            ))));
             out.line(format!("[server] HTTP API listening on {addr}"));
         }
         if cfg.periodic_stats {
