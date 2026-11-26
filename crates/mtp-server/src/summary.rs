@@ -135,7 +135,7 @@ fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 
 fn span_s(first: Option<u64>, last: Option<u64>) -> f64 {
     match (first, last) {
-        (Some(f), Some(l)) => ((l - f) as f64 / 1e9).max(1e-9),
+        (Some(f), Some(l)) => (l.saturating_sub(f) as f64 / 1e9).max(1e-9),
         _ => 0.0,
     }
 }

@@ -62,15 +62,15 @@ impl FlowStats {
         self.seen.insert(seq);
         self.seen_fifo.push_back(seq);
 
-        self.packets += 1;
-        self.bytes += length;
-        self.bytes_out += length;
+        self.packets = self.packets.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(length);
+        self.bytes_out = self.bytes_out.saturating_add(length);
         self.first_ns.get_or_insert(recv_ns);
         self.last_ns = Some(recv_ns);
         push_capped(&mut self.arrival_ms, recv_ns as f64 / 1e6);
 
         if let Some(prev) = self.last_arrival_ns {
-            let ipa = ((recv_ns as i64 - prev as i64) as f64 / 1e6).max(0.0);
+            let ipa = recv_ns.saturating_sub(prev) as f64 / 1e6;
             push_capped(&mut self.ipa_ms, ipa);
             if ipa > 0.0 {
                 push_capped(&mut self.pps_series, 1000.0 / ipa);
@@ -79,7 +79,7 @@ impl FlowStats {
         self.last_arrival_ns = Some(recv_ns);
 
         // Transit time against the client's send timestamp (clocks may differ).
-        let transit_ms = (recv_ns as i64 - send_ns as i64) as f64 / 1e6;
+        let transit_ms = (i128::from(recv_ns) - i128::from(send_ns)) as f64 / 1e6;
         if let Some(prev) = self.last_transit_ms {
             let dt = (transit_ms - prev).abs();
             push_capped(&mut self.jitter_samples_ms, dt);
@@ -91,14 +91,14 @@ impl FlowStats {
         match self.seq_expected {
             None => {
                 self.first_seq = Some(seq);
-                self.seq_expected = Some(seq + 1);
+                self.seq_expected = Some(seq.saturating_add(1));
             }
-            Some(exp) if seq == exp => self.seq_expected = Some(exp + 1),
+            Some(exp) if seq == exp => self.seq_expected = Some(exp.saturating_add(1)),
             Some(exp) if seq > exp => {
                 let gap = seq - exp;
-                self.lost += gap;
+                self.lost = self.lost.saturating_add(gap);
                 push_capped(&mut self.loss_bursts, gap as f64);
-                self.seq_expected = Some(seq + 1);
+                self.seq_expected = Some(seq.saturating_add(1));
             }
             Some(exp) => {
                 self.reordered += 1;
@@ -116,7 +116,7 @@ impl FlowStats {
     /// Elapsed seconds between first and last packet (0 if undefined).
     pub fn elapsed_s(&self) -> f64 {
         match (self.first_ns, self.last_ns) {
-            (Some(f), Some(l)) => ((l - f) as f64 / 1e9).max(1e-9),
+            (Some(f), Some(l)) => (l.saturating_sub(f) as f64 / 1e9).max(1e-9),
             _ => 0.0,
         }
     }
@@ -130,7 +130,7 @@ impl FlowStats {
     }
 
     pub fn loss_pct(&self) -> f64 {
-        let seen = self.packets + self.lost;
+        let seen = self.packets.saturating_add(self.lost);
         if seen > 0 {
             self.lost as f64 / seen as f64 * 100.0
         } else {
@@ -221,6 +221,18 @@ mod tests {
         }
         assert_eq!(fs.arrival_ms.len(), SERIES_CAP);
         assert_eq!(fs.packets, SERIES_CAP as u64 + 10);
+    }
+
+    #[test]
+    fn hostile_values_do_not_panic() {
+        let mut fs = FlowStats::new(1);
+        fs.on_packet(u64::MAX, u64::MAX, 5, 10);
+        fs.on_packet(u64::MAX - 1, 1 << 63, 4, 10); // clock going backwards
+        fs.on_packet(0, u64::MAX, 3, 10);
+        fs.on_packet(u64::MAX, 0, 9, 10); // duplicate
+        assert_eq!(fs.packets, 3);
+        assert!(fs.elapsed_s() >= 0.0);
+        assert!(fs.loss_pct().is_finite());
     }
 
     #[test]

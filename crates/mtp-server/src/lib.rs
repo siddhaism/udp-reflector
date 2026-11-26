@@ -8,6 +8,7 @@ pub mod net;
 pub mod reflector;
 pub mod summary;
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -105,15 +106,12 @@ impl Server {
         Ok(Server { aggregator: agg, tcp_addrs, audio_addrs, video_addrs, tasks })
     }
 
-    /// Wait until a task exits (normally never) or `stop` resolves.
+    /// Wait until every task has exited (normally never) or `stop` resolves.
+    /// Any task that exits early or panics is logged.
     pub async fn run_until<F: std::future::Future>(mut self, stop: F) {
         tokio::select! {
             _ = stop => {}
-            _ = async {
-                for t in self.tasks.iter_mut() {
-                    let _ = t.await;
-                }
-            } => {}
+            _ = watch_tasks(&mut self.tasks) => {}
         }
         self.shutdown();
     }
@@ -129,6 +127,32 @@ impl Drop for Server {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Resolve once all tasks have finished, logging each one as it ends.
+async fn watch_tasks(tasks: &mut Vec<JoinHandle<()>>) {
+    std::future::poll_fn(|cx| {
+        let mut i = 0;
+        while i < tasks.len() {
+            match std::pin::Pin::new(&mut tasks[i]).poll(cx) {
+                std::task::Poll::Ready(res) => {
+                    match res {
+                        Ok(()) => eprintln!("[server] background task exited unexpectedly"),
+                        Err(e) if e.is_panic() => eprintln!("[server] background task panicked: {e}"),
+                        Err(e) => eprintln!("[server] background task failed: {e}"),
+                    }
+                    tasks.swap_remove(i);
+                }
+                std::task::Poll::Pending => i += 1,
+            }
+        }
+        if tasks.is_empty() {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await
 }
 
 async fn periodic_stats(cfg: Config, agg: Arc<Mutex<Aggregator>>, out: Out) {

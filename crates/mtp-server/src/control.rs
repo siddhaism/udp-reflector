@@ -116,7 +116,7 @@ async fn session(
     let out_line = to_line(&resp).map_err(std::io::Error::other)?;
     wr.write_all(&out_line).await?;
     *bytes_out += out_line.len();
-    *hello_to_resp_ms = Some(((now_ns() - hello_rx_ns) as f64 / 1e6).max(0.0));
+    *hello_to_resp_ms = Some((now_ns().saturating_sub(hello_rx_ns) as f64 / 1e6).max(0.0));
 
     // Stay connected until the client closes; handle path updates meanwhile.
     loop {
