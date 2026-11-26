@@ -1,0 +1,136 @@
+"""Read-only, opt-in REST API for the server, built on asyncio streams.
+
+One response per connection (Connection: close). Only GET is served.
+"""
+import asyncio
+import json
+from urllib.parse import parse_qs, urlsplit
+
+MAX_REQUEST_LINE = 2048
+MAX_HEADER_BYTES = 8192
+READ_TIMEOUT_S = 5.0
+
+_REASONS = {
+    200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed",
+    408: "Request Timeout", 414: "URI Too Long", 431: "Request Header Fields Too Large",
+    500: "Internal Server Error",
+}
+
+
+class _HttpError(Exception):
+    def __init__(self, status, message, headers=None):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.headers = headers or {}
+
+
+def _response(status, obj, extra_headers=None):
+    body = json.dumps(obj).encode()
+    head = [
+        f"HTTP/1.1 {status} {_REASONS.get(status, 'Error')}",
+        "Content-Type: application/json",
+        f"Content-Length: {len(body)}",
+        "Connection: close",
+    ]
+    for k, v in (extra_headers or {}).items():
+        head.append(f"{k}: {v}")
+    return ("\r\n".join(head) + "\r\n\r\n").encode() + body
+
+
+async def _read_request(reader):
+    """Return (method, target). Raises _HttpError on malformed/oversized input."""
+    try:
+        line = await reader.readuntil(b"\r\n")
+    except asyncio.LimitOverrunError:
+        raise _HttpError(414, "request line too long")
+    except asyncio.IncompleteReadError:
+        raise _HttpError(400, "incomplete request")
+    if len(line) > MAX_REQUEST_LINE:
+        raise _HttpError(414, "request line too long")
+    parts = line.decode("latin-1").rstrip("\r\n").split(" ")
+    if len(parts) != 3 or not parts[2].startswith("HTTP/"):
+        raise _HttpError(400, "malformed request line")
+    total = 0
+    while True:
+        try:
+            h = await reader.readuntil(b"\r\n")
+        except asyncio.LimitOverrunError:
+            raise _HttpError(431, "headers too large")
+        except asyncio.IncompleteReadError:
+            raise _HttpError(400, "incomplete headers")
+        total += len(h)
+        if total > MAX_HEADER_BYTES:
+            raise _HttpError(431, "headers too large")
+        if h == b"\r\n":
+            break
+    return parts[0], parts[1]
+
+
+def _single(qs, name):
+    vals = qs.get(name)
+    if vals is None:
+        return None
+    if len(vals) != 1 or vals[0] == "":
+        raise _HttpError(400, f"invalid query parameter: {name}")
+    return vals[0]
+
+
+def _route(method, target, summary_fn):
+    if method != "GET":
+        raise _HttpError(405, "method not allowed", {"Allow": "GET"})
+    split = urlsplit(target)
+    path = split.path
+    if path not in ("/healthz", "/summary", "/flows"):
+        raise _HttpError(404, "not found")
+    if path == "/healthz":
+        return {"status": "ok"}
+    qs = parse_qs(split.query, keep_blank_values=True)
+    unknown = set(qs) - {"host", "port"}
+    if unknown:
+        raise _HttpError(400, f"unknown query parameter: {sorted(unknown)[0]}")
+    host = _single(qs, "host")
+    port_s = _single(qs, "port")
+    port = None
+    if port_s is not None:
+        if not port_s.isascii() or not port_s.isdigit() or not 0 <= int(port_s) <= 65535:
+            raise _HttpError(400, "invalid query parameter: port")
+        port = int(port_s)
+    summary = summary_fn(host, port)
+    if path == "/summary":
+        return summary
+    return {"flows": summary.get("flows", [])}
+
+
+async def _handle(reader, writer, summary_fn, read_timeout):
+    try:
+        try:
+            method, target = await asyncio.wait_for(_read_request(reader), read_timeout)
+            data = _response(200, _route(method, target, summary_fn))
+        except asyncio.TimeoutError:
+            data = _response(408, {"error": "request timeout"})
+        except _HttpError as e:
+            data = _response(e.status, {"error": e.message}, e.headers)
+        except Exception:
+            data = _response(500, {"error": "internal error"})
+        writer.write(data)
+        await asyncio.wait_for(writer.drain(), read_timeout)
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+async def start_http_server(summary_fn, host="127.0.0.1", port=0, read_timeout=READ_TIMEOUT_S):
+    """Start the REST server.
+
+    summary_fn(filter_host, filter_port) must return the generate_summary_json
+    dict (never None). Returns the asyncio.Server.
+    """
+    return await asyncio.start_server(
+        lambda r, w: _handle(r, w, summary_fn, read_timeout),
+        host, port, limit=MAX_REQUEST_LINE,
+    )
