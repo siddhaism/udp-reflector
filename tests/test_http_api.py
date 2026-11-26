@@ -170,3 +170,68 @@ def test_udp_echo_while_http_hit():
         for t in transports:
             t.close()
     run(go())
+
+
+def test_cache_ttl_with_fake_clock():
+    async def go():
+        calls = []
+        now = [100.0]
+
+        def fn(h, p):
+            calls.append((h, p))
+            return {"idle": True, "active_flows": []}
+
+        srv = await start_http_server(fn, "127.0.0.1", 0, clock=lambda: now[0])
+        port = srv.sockets[0].getsockname()[1]
+        await get(port, "/summary")
+        await get(port, "/flows")
+        assert len(calls) == 1
+        await get(port, "/summary?host=a")
+        assert len(calls) == 2  # different filter key
+        now[0] += 0.3
+        await get(port, "/summary")
+        assert len(calls) == 3
+        srv.close()
+    run(go())
+
+
+def test_malformed_target_is_400():
+    async def go():
+        srv, port = await start(server.Aggregator())
+        st, _, b = await get(port, "//[")
+        assert st == 400 and "error" in b
+        srv.close()
+    run(go())
+
+
+def test_bare_lf_accepted():
+    async def go():
+        srv, port = await start(server.Aggregator())
+        st, _, b = await raw(port, b"GET /healthz HTTP/1.1\nHost: x\n\n")
+        assert (st, b) == (200, {"status": "ok"})
+        srv.close()
+    run(go())
+
+
+def test_bad_percent_and_utf8_is_400():
+    async def go():
+        srv, port = await start(server.Aggregator())
+        for q in ("host=%zz", "host=%ff", "port=%zz", "port=%ff", "host=%", "host=%4"):
+            for path in ("/summary", "/flows"):
+                st, _, b = await get(port, f"{path}?{q}")
+                assert st == 400 and "error" in b, (path, q)
+        assert (await get(port, "/healthz?host=%zz"))[0] == 200
+        srv.close()
+    run(go())
+
+
+def test_connection_cap_503():
+    async def go():
+        srv, port = await start(server.Aggregator(), max_connections=2)
+        held = [await asyncio.open_connection("127.0.0.1", port) for _ in range(2)]
+        st, _, b = await get(port, "/healthz")
+        assert st == 503 and "error" in b
+        for r, w in held:
+            w.close()
+        srv.close()
+    run(go())

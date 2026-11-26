@@ -4,15 +4,20 @@ One response per connection (Connection: close). Only GET is served.
 """
 import asyncio
 import json
+import re
+import time
 from urllib.parse import parse_qs, urlsplit
 
 MAX_REQUEST_LINE = 2048
 MAX_HEADER_BYTES = 8192
 READ_TIMEOUT_S = 5.0
+MAX_CONNECTIONS = 64
+CACHE_TTL_S = 0.25
+_BAD_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
 _REASONS = {
     200: "OK", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed",
-    408: "Request Timeout", 414: "URI Too Long", 431: "Request Header Fields Too Large",
+    408: "Request Timeout", 503: "Service Unavailable", 414: "URI Too Long", 431: "Request Header Fields Too Large",
     500: "Internal Server Error",
 }
 
@@ -41,7 +46,7 @@ def _response(status, obj, extra_headers=None):
 async def _read_request(reader):
     """Return (method, target). Raises _HttpError on malformed/oversized input."""
     try:
-        line = await reader.readuntil(b"\r\n")
+        line = await reader.readuntil(b"\n")
     except asyncio.LimitOverrunError:
         raise _HttpError(414, "request line too long")
     except asyncio.IncompleteReadError:
@@ -54,7 +59,7 @@ async def _read_request(reader):
     total = 0
     while True:
         try:
-            h = await reader.readuntil(b"\r\n")
+            h = await reader.readuntil(b"\n")
         except asyncio.LimitOverrunError:
             raise _HttpError(431, "headers too large")
         except asyncio.IncompleteReadError:
@@ -62,7 +67,7 @@ async def _read_request(reader):
         total += len(h)
         if total > MAX_HEADER_BYTES:
             raise _HttpError(431, "headers too large")
-        if h == b"\r\n":
+        if h in (b"\r\n", b"\n"):
             break
     return parts[0], parts[1]
 
@@ -79,13 +84,21 @@ def _single(qs, name):
 def _route(method, target, summary_fn):
     if method != "GET":
         raise _HttpError(405, "method not allowed", {"Allow": "GET"})
-    split = urlsplit(target)
+    try:
+        split = urlsplit(target)
+    except ValueError:
+        raise _HttpError(400, "malformed request target")
     path = split.path
     if path not in ("/healthz", "/summary", "/flows"):
         raise _HttpError(404, "not found")
     if path == "/healthz":
         return {"status": "ok"}
-    qs = parse_qs(split.query, keep_blank_values=True)
+    if _BAD_ESCAPE.search(split.query):
+        raise _HttpError(400, "invalid percent-encoding in query")
+    try:
+        qs = parse_qs(split.query, keep_blank_values=True, errors="strict")
+    except ValueError:
+        raise _HttpError(400, "invalid query encoding")
     unknown = set(qs) - {"host", "port"}
     if unknown:
         raise _HttpError(400, f"unknown query parameter: {sorted(unknown)[0]}")
@@ -102,7 +115,19 @@ def _route(method, target, summary_fn):
     return {"flows": summary.get("flows", [])}
 
 
-async def _handle(reader, writer, summary_fn, read_timeout):
+async def _handle(reader, writer, summary_fn, read_timeout, state, max_connections):
+    if state["active"] >= max_connections:
+        try:
+            writer.write(_response(503, {"error": "too many connections"}))
+            await asyncio.wait_for(writer.drain(), read_timeout)
+            # Best-effort drain of the pending request so close does not RST the 503.
+            await asyncio.wait_for(reader.read(MAX_HEADER_BYTES), 0.1)
+        except Exception:
+            pass
+        finally:
+            writer.close()
+        return
+    state["active"] += 1
     try:
         try:
             method, target = await asyncio.wait_for(_read_request(reader), read_timeout)
@@ -118,19 +143,39 @@ async def _handle(reader, writer, summary_fn, read_timeout):
     except Exception:
         pass
     finally:
+        state["active"] -= 1
         try:
             writer.close()
         except Exception:
             pass
 
 
-async def start_http_server(summary_fn, host="127.0.0.1", port=0, read_timeout=READ_TIMEOUT_S):
+def _cached(summary_fn, ttl, clock):
+    cache = {}
+
+    def fn(host, port):
+        now = clock()
+        hit = cache.get((host, port))
+        if hit is not None and now - hit[0] < ttl:
+            return hit[1]
+        val = summary_fn(host, port)
+        if len(cache) >= 256:
+            cache.clear()
+        cache[(host, port)] = (now, val)
+        return val
+    return fn
+
+
+async def start_http_server(summary_fn, host="127.0.0.1", port=0, read_timeout=READ_TIMEOUT_S,
+                            max_connections=MAX_CONNECTIONS, cache_ttl=CACHE_TTL_S, clock=time.monotonic):
     """Start the REST server.
 
     summary_fn(filter_host, filter_port) must return the generate_summary_json
     dict (never None). Returns the asyncio.Server.
     """
+    fn = _cached(summary_fn, cache_ttl, clock)
+    state = {"active": 0}
     return await asyncio.start_server(
-        lambda r, w: _handle(r, w, summary_fn, read_timeout),
+        lambda r, w: _handle(r, w, fn, read_timeout, state, max_connections),
         host, port, limit=MAX_REQUEST_LINE,
     )
