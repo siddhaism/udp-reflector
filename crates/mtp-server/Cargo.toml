@@ -1,0 +1,16 @@
+[package]
+name = "mtp-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "udp-server"
+path = "src/main.rs"
+
+[dependencies]
+mtp-core = { path = "../mtp-core" }
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+socket2.workspace = true
+tokio.workspace = true
